@@ -100,6 +100,9 @@ enum mbl_type {
 	MBL_TYPE_HEADSET
 };
 
+/* Polling interval for status updates (5 minutes = 300000ms) */
+#define STATUS_POLL_INTERVAL 300000
+
 /* Device connection states */
 enum mbl_state {
 	MBL_STATE_INIT,         /* Just loaded from config */
@@ -178,6 +181,7 @@ struct mbl_pvt {
 	short alignment_samples[4];
 	int alignment_count;
 	int ring_sched_id;
+	int status_sched_id;			/*!\< scheduler ID for periodic status polling */
 	struct ast_dsp *dsp;
 	struct ast_sched_context *sched;
 	int hangupcause;
@@ -230,9 +234,11 @@ static char *handle_cli_mobile_show_adapter(struct ast_cli_entry *e, int cmd, st
 static char *handle_cli_mobile_search(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_cli_mobile_rfcomm(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *handle_cli_mobile_cusd(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *handle_cli_mobile_show_device(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 
 static struct ast_cli_entry mbl_cli[] = {
 	AST_CLI_DEFINE(handle_cli_mobile_show_devices,  "Show Bluetooth Cell / Mobile devices"),
+	AST_CLI_DEFINE(handle_cli_mobile_show_device,   "Show detailed Bluetooth device status"),
 	AST_CLI_DEFINE(handle_cli_mobile_show_adapters, "Show Bluetooth adapters"),
 	AST_CLI_DEFINE(handle_cli_mobile_show_adapter,  "Show detailed Bluetooth adapter info"),
 	AST_CLI_DEFINE(handle_cli_mobile_search,        "Search for Bluetooth Cell / Mobile devices"),
@@ -244,12 +250,20 @@ static struct ast_cli_entry mbl_cli[] = {
 
 /* App stuff */
 static char *app_mblstatus = "MobileStatus";
-static char *mblstatus_synopsis = "MobileStatus(Device,Variable)";
+static char *mblstatus_synopsis = "MobileStatus(Device,Variable[,Type])";
 static char *mblstatus_desc =
-"MobileStatus(Device,Variable)\n"
+"MobileStatus(Device,Variable[,Type])\n"
 "  Device - Id of mobile device from mobile.conf\n"
-"  Variable - Variable to store status in will be 1-3.\n"
-"             In order, Disconnected, Connected & Free, Connected & Busy.\n";
+"  Variable - Variable to store status\n"
+"  Type - Optional status type:\n"
+"    CONNECTION - 1=Disconnected, 2=Connected & Free, 3=Connected & Busy (default)\n"
+"    SIGNAL - Signal strength (0-5)\n"
+"    ROAM - Roaming status (0=no, 1=yes)\n"
+"    PROVIDER - Operator name\n"
+"    MCCMNC - Mobile Country Code / Network Code\n"
+"    REGSTATUS - Registration status (0-5)\n"
+"    BATTERY - Battery level (0-100)\n"
+"    CHARGING - Charging status (0=no, 1=yes, -1=unknown)\n";
 
 static char *app_mblsendsms = "MobileSendSMS";
 static char *mblsendsms_synopsis = "MobileSendSMS(Device,Dest,Message)";
@@ -294,6 +308,7 @@ static void *do_sco_listen(void *data);
 static int sdp_search(char *addr, int profile);
 
 static int headset_send_ring(const void *data);
+static int mbl_status_poll(const void *data);
 
 /*
  * bluetooth handsfree profile helpers
@@ -404,6 +419,24 @@ struct hfp_pvt {
 	int sent_alerting;		/*!< have we sent alerting? */
 	int hfp_version;		/*!< detected HFP version: 10=1.0, 15=1.5, 16=1.6, 17=1.7 */
 	int brsf_raw;			/*!< raw BRSF value from phone */
+
+	/* Network registration status */
+	int creg;			/*!< Circuit switched registration status (0-5) */
+	int cgreg;			/*!< Packet switched registration status (0-5) */
+
+	/* Operator information */
+	char provider_name[64];		/*!< Operator name from AT+COPS */
+	char mccmnc[10];		/*!< MCC/MNC code from AT+COPS format 2 */
+
+	/* Battery status */
+	int battery_percent;		/*!< Battery level 0-100, or -1 if unknown */
+	int charging;			/*!< 0=discharging, 1=charging, -1=unknown */
+
+	/* Capability flags for unsupported commands */
+	unsigned int no_creg:1;		/*!< Device doesn't support AT+CREG */
+	unsigned int no_cgreg:1;	/*!< Device doesn't support AT+CGREG */
+	unsigned int no_cops:1;		/*!< Device doesn't support AT+COPS */
+	unsigned int no_cbc:1;		/*!< Device doesn't support AT+CBC */
 };
 
 
@@ -431,6 +464,9 @@ static int hfp_parse_cind(struct hfp_pvt *hfp, char *buf);
 static int hfp_parse_cind_test(struct hfp_pvt *hfp, char *buf);
 static char *hfp_parse_cusd(struct hfp_pvt *hfp, char *buf);
 static int hfp_parse_cscs(struct hfp_pvt *hfp, char *buf);
+static int hfp_parse_creg(char *buf);
+static int hfp_parse_cops(char *buf, char *oper, size_t oper_len, int *format);
+static int hfp_parse_cbc(char *buf, int *level, int *charging);
 
 static int hfp_brsf2int(struct hfp_hf *hf);
 static struct hfp_ag *hfp_int2brsf(int brsf, struct hfp_ag *ag);
@@ -456,6 +492,10 @@ static int hfp_send_atd(struct hfp_pvt *hfp, const char *number);
 static int hfp_send_ata(struct hfp_pvt *hfp);
 static int hfp_send_cusd(struct hfp_pvt *hfp, const char *code);
 static int hfp_send_cscs(struct hfp_pvt *hfp, const char *charset);
+static int hfp_send_creg(struct hfp_pvt *hfp, int mode);
+static int hfp_send_cgreg(struct hfp_pvt *hfp, int mode);
+static int hfp_send_cops(struct hfp_pvt *hfp, int format, int query);
+static int hfp_send_cbc(struct hfp_pvt *hfp);
 
 /*
  * bluetooth headset profile helpers
@@ -508,6 +548,16 @@ typedef enum {
 	AT_CSCS,
 	AT_CSCS_SET,
 	AT_CSCS_VERIFY,
+	/* Device status commands */
+	AT_CREG,		/* +CREG response */
+	AT_CREG_SET,		/* AT+CREG=1 command */
+	AT_CGREG,		/* +CGREG response */
+	AT_CGREG_SET,		/* AT+CGREG=1 command */
+	AT_COPS,		/* +COPS response */
+	AT_COPS_SET_NUMERIC,	/* AT+COPS=3,2 (numeric format) */
+	AT_COPS_SET_ALPHA,	/* AT+COPS=3,0 (alphanumeric format) */
+	AT_COPS_QUERY,		/* AT+COPS? query */
+	AT_CBC,			/* +CBC response */
 } at_message_t;
 
 static int at_match_prefix(char *buf, char *prefix);
@@ -611,6 +661,34 @@ static const char *mbl_lmp_vertostr(int lmp_ver)
 	}
 }
 
+/* Convert network registration status to human-readable string */
+static const char *regstatus_to_str(int status)
+{
+	switch (status) {
+	case 0: return "Not Registered";
+	case 1: return "Registered (Home)";
+	case 2: return "Searching";
+	case 3: return "Denied";
+	case 4: return "Unknown";
+	case 5: return "Registered (Roaming)";
+	default: return "N/A";
+	}
+}
+
+/* Generate visual signal strength bar */
+static const char *signal_bar(int level)
+{
+	static char bar[16];
+	int i, max = 5;
+	level = (level > max) ? max : (level < 0) ? 0 : level;
+	bar[0] = '[';
+	for (i = 0; i < max; i++)
+		bar[i + 1] = (i < level) ? '|' : ' ';
+	bar[max + 1] = ']';
+	bar[max + 2] = '\0';
+	return bar;
+}
+
 
 /* CLI Commands implementation */
 
@@ -677,6 +755,111 @@ static char *handle_cli_mobile_show_devices(struct ast_cli_entry *e, int cmd, st
 	return CLI_SUCCESS;
 }
 
+
+static char *handle_cli_mobile_show_device(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct mbl_pvt *pvt;
+	char bdaddr[18];
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "mobile show device";
+		e->usage =
+			"Usage: mobile show device <device_id>\n"
+			"       Shows detailed status for a Bluetooth device.\n";
+		return NULL;
+	case CLI_GENERATE:
+		/* Tab completion for device IDs */
+		if (a->pos == 3) {
+			int wordlen = strlen(a->word);
+			int which = 0;
+			AST_RWLIST_RDLOCK(&devices);
+			AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
+				if (!strncasecmp(a->word, pvt->id, wordlen) && ++which > a->n) {
+					char *ret = ast_strdup(pvt->id);
+					AST_RWLIST_UNLOCK(&devices);
+					return ret;
+				}
+			}
+			AST_RWLIST_UNLOCK(&devices);
+		}
+		return NULL;
+	}
+
+	if (a->argc != 4)
+		return CLI_SHOWUSAGE;
+
+	AST_RWLIST_RDLOCK(&devices);
+	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
+		if (!strcmp(pvt->id, a->argv[3]))
+			break;
+	}
+
+	if (!pvt) {
+		ast_cli(a->fd, "Device '%s' not found\n", a->argv[3]);
+		AST_RWLIST_UNLOCK(&devices);
+		return CLI_SUCCESS;
+	}
+
+	ast_mutex_lock(&pvt->lock);
+	ba2str(&pvt->addr, bdaddr);
+
+	ast_cli(a->fd, "Device: %s\n", pvt->id);
+	ast_cli(a->fd, "Address: %s\n", bdaddr);
+	ast_cli(a->fd, "Name: %s\n", pvt->remote_name[0] ? pvt->remote_name : "-");
+	ast_cli(a->fd, "Type: %s\n", pvt->type == MBL_TYPE_PHONE ? "Phone" : "Headset");
+	ast_cli(a->fd, "State: %s\n", mbl_state2str(pvt->state));
+	ast_cli(a->fd, "Profile: %s\n", pvt->profile_name[0] ? pvt->profile_name : "-");
+
+	if (pvt->hfp) {
+		if (pvt->hfp->hfp_version > 0) {
+			ast_cli(a->fd, "HFP Version: %d.%d\n",
+				pvt->hfp->hfp_version / 10, pvt->hfp->hfp_version % 10);
+		}
+
+		if (pvt->hfp->initialized) {
+			int sig = pvt->hfp->cind_state[pvt->hfp->cind_map.signal];
+			int roam = pvt->hfp->cind_state[pvt->hfp->cind_map.roam];
+
+			ast_cli(a->fd, "Signal: %d %s\n", sig, signal_bar(sig));
+			ast_cli(a->fd, "Roaming: %s\n", roam ? "Yes" : "No");
+
+			/* Battery - prefer CBC if available, fallback to HFP indicator */
+			if (pvt->hfp->battery_percent >= 0) {
+				const char *chrg = pvt->hfp->charging == 1 ? "Charging" :
+				                   pvt->hfp->charging == 0 ? "Discharging" : "Unknown";
+				ast_cli(a->fd, "Battery: %d%% (%s)\n", pvt->hfp->battery_percent, chrg);
+			} else {
+				int batt = pvt->hfp->cind_state[pvt->hfp->cind_map.battchg];
+				ast_cli(a->fd, "Battery: ~%d%% (HFP)\n", batt * 20);
+			}
+
+			/* Provider information */
+			if (pvt->hfp->provider_name[0])
+				ast_cli(a->fd, "Provider: %s\n", pvt->hfp->provider_name);
+			if (pvt->hfp->mccmnc[0])
+				ast_cli(a->fd, "MCC/MNC: %s\n", pvt->hfp->mccmnc);
+
+			/* Registration status */
+			if (!pvt->hfp->no_creg) {
+				ast_cli(a->fd, "CS Registration: %s\n", regstatus_to_str(pvt->hfp->creg));
+			}
+			if (!pvt->hfp->no_cgreg) {
+				ast_cli(a->fd, "PS Registration: %s\n", regstatus_to_str(pvt->hfp->cgreg));
+			}
+		}
+	}
+
+	if (pvt->sco_mtu > 0)
+		ast_cli(a->fd, "SCO MTU: %d\n", pvt->sco_mtu);
+	if (pvt->bt_ver > 0)
+		ast_cli(a->fd, "BT Version: %s\n", mbl_lmp_vertostr(pvt->bt_ver));
+
+	ast_mutex_unlock(&pvt->lock);
+	AST_RWLIST_UNLOCK(&devices);
+
+	return CLI_SUCCESS;
+}
 
 
 static char *handle_cli_mobile_show_adapters(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
@@ -1078,15 +1261,14 @@ e_return:
 
 static int mbl_status_exec(struct ast_channel *ast, const char *data)
 {
-
 	struct mbl_pvt *pvt;
 	char *parse;
-	int stat;
-	char status[2];
+	char result[128] = "";
 
 	AST_DECLARE_APP_ARGS(args,
 		AST_APP_ARG(device);
 		AST_APP_ARG(variable);
+		AST_APP_ARG(type);
 	);
 
 	if (ast_strlen_zero(data))
@@ -1099,29 +1281,63 @@ static int mbl_status_exec(struct ast_channel *ast, const char *data)
 	if (ast_strlen_zero(args.device) || ast_strlen_zero(args.variable))
 		return -1;
 
-	stat = 1;
+	/* Default type is CONNECTION */
+	if (ast_strlen_zero(args.type))
+		args.type = "CONNECTION";
 
 	AST_RWLIST_RDLOCK(&devices);
 	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
 		if (!strcmp(pvt->id, args.device))
 			break;
 	}
-	AST_RWLIST_UNLOCK(&devices);
 
 	if (pvt) {
 		ast_mutex_lock(&pvt->lock);
-		if (pvt->connected)
-			stat = 2;
-		if (pvt->owner)
-			stat = 3;
+
+		if (!strcasecmp(args.type, "CONNECTION")) {
+			int stat = 1;  /* Disconnected */
+			if (pvt->connected)
+				stat = 2;  /* Connected & Free */
+			if (pvt->owner)
+				stat = 3;  /* Connected & Busy */
+			snprintf(result, sizeof(result), "%d", stat);
+		} else if (!strcasecmp(args.type, "SIGNAL")) {
+			if (pvt->hfp && pvt->hfp->initialized)
+				snprintf(result, sizeof(result), "%d",
+					pvt->hfp->cind_state[pvt->hfp->cind_map.signal]);
+		} else if (!strcasecmp(args.type, "ROAM")) {
+			if (pvt->hfp && pvt->hfp->initialized)
+				snprintf(result, sizeof(result), "%d",
+					pvt->hfp->cind_state[pvt->hfp->cind_map.roam]);
+		} else if (!strcasecmp(args.type, "PROVIDER")) {
+			if (pvt->hfp)
+				ast_copy_string(result, pvt->hfp->provider_name, sizeof(result));
+		} else if (!strcasecmp(args.type, "MCCMNC")) {
+			if (pvt->hfp)
+				ast_copy_string(result, pvt->hfp->mccmnc, sizeof(result));
+		} else if (!strcasecmp(args.type, "REGSTATUS")) {
+			if (pvt->hfp)
+				snprintf(result, sizeof(result), "%d", pvt->hfp->creg);
+		} else if (!strcasecmp(args.type, "BATTERY")) {
+			if (pvt->hfp) {
+				if (pvt->hfp->battery_percent >= 0)
+					snprintf(result, sizeof(result), "%d", pvt->hfp->battery_percent);
+				else if (pvt->hfp->initialized)
+					snprintf(result, sizeof(result), "%d",
+						pvt->hfp->cind_state[pvt->hfp->cind_map.battchg] * 20);
+			}
+		} else if (!strcasecmp(args.type, "CHARGING")) {
+			if (pvt->hfp)
+				snprintf(result, sizeof(result), "%d", pvt->hfp->charging);
+		}
+
 		ast_mutex_unlock(&pvt->lock);
 	}
+	AST_RWLIST_UNLOCK(&devices);
 
-	snprintf(status, sizeof(status), "%d", stat);
-	pbx_builtin_setvar_helper(ast, args.variable, status);
+	pbx_builtin_setvar_helper(ast, args.variable, result);
 
 	return 0;
-
 }
 
 static int mbl_sendsms_exec(struct ast_channel *ast, const char *data)
@@ -2601,6 +2817,14 @@ static at_message_t at_read_full(int rsock, char *buf, size_t count)
 		return AT_ECAM;
 	} else if (at_match_prefix(buf, "+CSCS:")) {
 		return AT_CSCS;
+	} else if (at_match_prefix(buf, "+CREG:")) {
+		return AT_CREG;
+	} else if (at_match_prefix(buf, "+CGREG:")) {
+		return AT_CGREG;
+	} else if (at_match_prefix(buf, "+COPS:")) {
+		return AT_COPS;
+	} else if (at_match_prefix(buf, "+CBC:")) {
+		return AT_CBC;
 	} else {
 		return AT_UNKNOWN;
 	}
@@ -2686,6 +2910,25 @@ static inline const char *at_msg2str(at_message_t msg)
 		return "AT+CUSD";
 	case AT_ECAM:
 		return "AT*ECAM";
+	/* Device status commands */
+	case AT_CREG:
+		return "AT+CREG";
+	case AT_CREG_SET:
+		return "AT+CREG (Set)";
+	case AT_CGREG:
+		return "AT+CGREG";
+	case AT_CGREG_SET:
+		return "AT+CGREG (Set)";
+	case AT_COPS:
+		return "AT+COPS";
+	case AT_COPS_SET_NUMERIC:
+		return "AT+COPS=3,2";
+	case AT_COPS_SET_ALPHA:
+		return "AT+COPS=3,0";
+	case AT_COPS_QUERY:
+		return "AT+COPS?";
+	case AT_CBC:
+		return "AT+CBC";
 	}
 }
 
@@ -3146,6 +3389,65 @@ static int hfp_send_cscs(struct hfp_pvt *hfp, const char *charset)
 		snprintf(buf, sizeof(buf), "AT+CSCS=?\r");
 
 	return rfcomm_write(hfp->rsock, buf);
+}
+
+/*!
+ * \brief Send AT+CREG command for network registration status
+ * \param hfp an hfp_pvt struct
+ * \param mode 0=disable, 1=enable unsolicited, -1=query current
+ * \return 0 on success, -1 on error
+ */
+static int hfp_send_creg(struct hfp_pvt *hfp, int mode)
+{
+	char cmd[32];
+	if (mode < 0)
+		snprintf(cmd, sizeof(cmd), "AT+CREG?\r");
+	else
+		snprintf(cmd, sizeof(cmd), "AT+CREG=%d\r", mode);
+	return rfcomm_write(hfp->rsock, cmd);
+}
+
+/*!
+ * \brief Send AT+CGREG command for GPRS registration status
+ * \param hfp an hfp_pvt struct
+ * \param mode 0=disable, 1=enable unsolicited, -1=query current
+ * \return 0 on success, -1 on error
+ */
+static int hfp_send_cgreg(struct hfp_pvt *hfp, int mode)
+{
+	char cmd[32];
+	if (mode < 0)
+		snprintf(cmd, sizeof(cmd), "AT+CGREG?\r");
+	else
+		snprintf(cmd, sizeof(cmd), "AT+CGREG=%d\r", mode);
+	return rfcomm_write(hfp->rsock, cmd);
+}
+
+/*!
+ * \brief Send AT+COPS command for operator information
+ * \param hfp an hfp_pvt struct
+ * \param format 0=long alphanumeric, 1=short alphanumeric, 2=numeric MCC/MNC
+ * \param query if true, send AT+COPS? query, otherwise AT+COPS=3,<format>
+ * \return 0 on success, -1 on error
+ */
+static int hfp_send_cops(struct hfp_pvt *hfp, int format, int query)
+{
+	char cmd[32];
+	if (query)
+		snprintf(cmd, sizeof(cmd), "AT+COPS?\r");
+	else
+		snprintf(cmd, sizeof(cmd), "AT+COPS=3,%d\r", format);
+	return rfcomm_write(hfp->rsock, cmd);
+}
+
+/*!
+ * \brief Send AT+CBC command for battery status
+ * \param hfp an hfp_pvt struct
+ * \return 0 on success, -1 on error
+ */
+static int hfp_send_cbc(struct hfp_pvt *hfp)
+{
+	return rfcomm_write(hfp->rsock, "AT+CBC\r");
 }
 
 /*
@@ -4050,8 +4352,68 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 		case AT_CNMI:
 			ast_debug(1, "[%s] sms new message indication enabled\n", pvt->id);
 			pvt->has_sms = 1;
+			/* Start device status query chain - begin with operator info */
+			if (!pvt->hfp->no_cops) {
+				/* Set COPS format to numeric (2) for MCC/MNC */
+				if (hfp_send_cops(pvt->hfp, 2, 0) || msg_queue_push(pvt, AT_OK, AT_COPS_SET_NUMERIC)) {
+					ast_debug(1, "[%s] error setting COPS numeric format\n", pvt->id);
+					/* Non-fatal, continue without COPS */
+					pvt->hfp->no_cops = 1;
+				}
+			}
 			break;
+		case AT_COPS_SET_NUMERIC:
+			/* AT+COPS=3,2 OK received - send query for MCC/MNC */
+			if (hfp_send_cops(pvt->hfp, 0, 1) || msg_queue_push(pvt, AT_COPS, AT_COPS_SET_NUMERIC)) {
+				ast_debug(1, "[%s] error querying COPS (numeric)\n", pvt->id);
+				pvt->hfp->no_cops = 1;
+				goto chain_creg;
+			}
+			break;
+		case AT_COPS_SET_ALPHA:
+		case AT_COPS_QUERY:
+			/* After COPS query (numeric) completed - continue to CREG chain */
+			/* Note: We skip alpha (provider name) query - MCC/MNC is the essential data */
+			goto chain_creg;
 		/* end initialization stuff */
+
+		/* Device status query chain - CREG */
+		case AT_CREG_SET:
+			/* Query current CREG status */
+			if (hfp_send_creg(pvt->hfp, -1) || msg_queue_push(pvt, AT_CREG, AT_CREG)) {
+				ast_debug(1, "[%s] error querying CREG\n", pvt->id);
+				pvt->hfp->no_creg = 1;
+				goto chain_cgreg;
+			}
+			break;
+		case AT_CREG:
+			ast_debug(1, "[%s] CREG status received\n", pvt->id);
+			goto chain_cgreg;
+
+		/* Device status query chain - CGREG */
+		case AT_CGREG_SET:
+			/* Query current CGREG status */
+			if (hfp_send_cgreg(pvt->hfp, -1) || msg_queue_push(pvt, AT_CGREG, AT_CGREG)) {
+				ast_debug(1, "[%s] error querying CGREG\n", pvt->id);
+				pvt->hfp->no_cgreg = 1;
+				goto chain_cbc;
+			}
+			break;
+		case AT_CGREG:
+			ast_debug(1, "[%s] CGREG status received\n", pvt->id);
+			goto chain_cbc;
+
+		/* Device status query chain - CBC (battery) */
+		case AT_CBC:
+			ast_debug(1, "[%s] CBC battery status received\n", pvt->id);
+			/* Start periodic status polling (every 5 minutes) */
+			if (pvt->status_sched_id == -1) {
+				pvt->status_sched_id = ast_sched_add(pvt->sched, STATUS_POLL_INTERVAL, mbl_status_poll, pvt);
+				if (pvt->status_sched_id != -1) {
+					ast_debug(1, "[%s] Status polling scheduled\n", pvt->id);
+				}
+			}
+			break;
 
 		case AT_A:
 			ast_debug(1, "[%s] answer sent successfully\n", pvt->id);
@@ -4114,6 +4476,43 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
 	} else {
 		ast_debug(1, "[%s] received unexpected AT message 'OK'\n", pvt->id);
 	}
+	return 0;
+
+/* Labels for device status query chain - allows graceful fallback */
+chain_creg:
+	msg_queue_free_and_pop(pvt);
+	if (!pvt->hfp->no_creg) {
+		/* Enable CREG unsolicited notifications and query */
+		if (hfp_send_creg(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CREG_SET)) {
+			ast_debug(1, "[%s] error enabling CREG\n", pvt->id);
+			pvt->hfp->no_creg = 1;
+			goto chain_cgreg_start;
+		}
+		return 0;
+	}
+chain_cgreg_start:
+chain_cgreg:
+	if (!pvt->hfp->no_cgreg) {
+		/* Enable CGREG unsolicited notifications and query */
+		if (hfp_send_cgreg(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CGREG_SET)) {
+			ast_debug(1, "[%s] error enabling CGREG\n", pvt->id);
+			pvt->hfp->no_cgreg = 1;
+			goto chain_cbc_start;
+		}
+		return 0;
+	}
+chain_cbc_start:
+chain_cbc:
+	if (!pvt->hfp->no_cbc) {
+		/* Query battery status */
+		if (hfp_send_cbc(pvt->hfp) || msg_queue_push(pvt, AT_CBC, AT_CBC)) {
+			ast_debug(1, "[%s] error querying CBC\n", pvt->id);
+			pvt->hfp->no_cbc = 1;
+		} else {
+			return 0;
+		}
+	}
+	/* All device status queries done or skipped */
 	return 0;
 
 e_return:
@@ -4183,12 +4582,30 @@ static int handle_response_error(struct mbl_pvt *pvt, char *buf)
 			pvt->has_sms = 0;
 			ast_debug(1, "[%s] error setting CMGF\n", pvt->id);
 			ast_debug(1, "[%s] no SMS support\n", pvt->id);
-			break;
+			/* Continue with device status chain */
+			if (!pvt->hfp->no_cops) {
+				if (hfp_send_cops(pvt->hfp, 2, 0) || msg_queue_push(pvt, AT_OK, AT_COPS_SET_NUMERIC)) {
+					pvt->hfp->no_cops = 1;
+				} else {
+					break;
+				}
+			}
+			/* Fall through to start CREG if COPS disabled */
+			goto err_chain_creg;
 		case AT_CNMI:
 			pvt->has_sms = 0;
 			ast_debug(1, "[%s] error setting CNMI\n", pvt->id);
 			ast_debug(1, "[%s] no SMS support\n", pvt->id);
-			break;
+			/* Continue with device status chain */
+			if (!pvt->hfp->no_cops) {
+				if (hfp_send_cops(pvt->hfp, 2, 0) || msg_queue_push(pvt, AT_OK, AT_COPS_SET_NUMERIC)) {
+					pvt->hfp->no_cops = 1;
+				} else {
+					break;
+				}
+			}
+			/* Fall through to start CREG if COPS disabled */
+			goto err_chain_creg;
 		case AT_ECAM:
 			ast_debug(1, "[%s] Mobile does not support Sony Ericsson extensions\n", pvt->id);
 
@@ -4206,6 +4623,59 @@ static int handle_response_error(struct mbl_pvt *pvt, char *buf)
 
 			break;
 		/* end initialization stuff */
+
+		/* Device status command errors - non-fatal, continue chain */
+		case AT_COPS_SET_NUMERIC:
+		case AT_COPS_SET_ALPHA:
+		case AT_COPS_QUERY:
+		case AT_COPS:
+			ast_verb(3, "[%s] AT+COPS not supported, disabling\n", pvt->id);
+			pvt->hfp->no_cops = 1;
+			/* Continue to CREG */
+			if (!pvt->hfp->no_creg) {
+				if (hfp_send_creg(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CREG_SET)) {
+					pvt->hfp->no_creg = 1;
+				} else {
+					break;
+				}
+			}
+			/* Fall through to CGREG if CREG disabled */
+		case AT_CREG_SET:
+		case AT_CREG:
+			if (entry->response_to == AT_CREG_SET || entry->response_to == AT_CREG) {
+				ast_verb(3, "[%s] AT+CREG not supported, disabling\n", pvt->id);
+				pvt->hfp->no_creg = 1;
+			}
+			/* Continue to CGREG */
+			if (!pvt->hfp->no_cgreg) {
+				if (hfp_send_cgreg(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CGREG_SET)) {
+					pvt->hfp->no_cgreg = 1;
+				} else {
+					break;
+				}
+			}
+			/* Fall through to CBC if CGREG disabled */
+		case AT_CGREG_SET:
+		case AT_CGREG:
+			if (entry->response_to == AT_CGREG_SET || entry->response_to == AT_CGREG) {
+				ast_verb(3, "[%s] AT+CGREG not supported, disabling\n", pvt->id);
+				pvt->hfp->no_cgreg = 1;
+			}
+			/* Continue to CBC */
+			if (!pvt->hfp->no_cbc) {
+				if (hfp_send_cbc(pvt->hfp) || msg_queue_push(pvt, AT_CBC, AT_CBC)) {
+					pvt->hfp->no_cbc = 1;
+				} else {
+					break;
+				}
+			}
+			/* All device status done */
+			break;
+		case AT_CBC:
+			ast_verb(3, "[%s] AT+CBC not supported, disabling\n", pvt->id);
+			pvt->hfp->no_cbc = 1;
+			/* Device status chain complete */
+			break;
 
 		case AT_A:
 			ast_debug(1, "[%s] answer failed\n", pvt->id);
@@ -4245,6 +4715,32 @@ static int handle_response_error(struct mbl_pvt *pvt, char *buf)
 		ast_debug(1, "[%s] received unexpected AT message 'ERROR'\n", pvt->id);
 	}
 
+	return 0;
+
+/* Label for starting device status chain from error handlers */
+err_chain_creg:
+	msg_queue_free_and_pop(pvt);
+	if (!pvt->hfp->no_creg) {
+		if (hfp_send_creg(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CREG_SET)) {
+			pvt->hfp->no_creg = 1;
+		} else {
+			return 0;
+		}
+	}
+	if (!pvt->hfp->no_cgreg) {
+		if (hfp_send_cgreg(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CGREG_SET)) {
+			pvt->hfp->no_cgreg = 1;
+		} else {
+			return 0;
+		}
+	}
+	if (!pvt->hfp->no_cbc) {
+		if (hfp_send_cbc(pvt->hfp) || msg_queue_push(pvt, AT_CBC, AT_CBC)) {
+			pvt->hfp->no_cbc = 1;
+		} else {
+			return 0;
+		}
+	}
 	return 0;
 
 e_return:
@@ -4558,6 +5054,113 @@ static int hfp_parse_cscs(struct hfp_pvt *hfp, char *buf)
 }
 
 /*!
+ * \brief Parse +CREG or +CGREG response
+ * Format: +CREG: <n>,<stat> or +CREG: <stat>
+ * \param buf the buffer to parse (null terminated)
+ * \return registration status (0-5), or -1 on error
+ *
+ * Status values:
+ *   0 = Not registered, not searching
+ *   1 = Registered, home network
+ *   2 = Not registered, searching
+ *   3 = Registration denied
+ *   4 = Unknown
+ *   5 = Registered, roaming
+ */
+static int hfp_parse_creg(char *buf)
+{
+	int n, stat;
+	char *p = strchr(buf, ':');
+	if (!p) return -1;
+	p++;
+	while (*p == ' ') p++;
+
+	/* Try two-value format first: <n>,<stat> */
+	if (sscanf(p, "%d,%d", &n, &stat) == 2)
+		return stat;
+	/* Fall back to single value format: <stat> */
+	if (sscanf(p, "%d", &stat) == 1)
+		return stat;
+	return -1;
+}
+
+/*!
+ * \brief Parse +COPS response
+ * Format: +COPS: <mode>[,<format>,<oper>]
+ * \param buf response buffer
+ * \param oper buffer to store operator string (or NULL)
+ * \param oper_len size of oper buffer
+ * \param format pointer to store format (0=alpha, 2=numeric), or NULL
+ * \return 0 on success, -1 on error
+ */
+static int hfp_parse_cops(char *buf, char *oper, size_t oper_len, int *format)
+{
+	char *p, *start, *end;
+	int mode, fmt;
+
+	p = strchr(buf, ':');
+	if (!p) return -1;
+	p++;
+
+	/* Parse mode and format: +COPS: <mode>,<format>,"<oper>" */
+	if (sscanf(p, "%d,%d", &mode, &fmt) == 2) {
+		if (format) *format = fmt;
+	} else {
+		if (format) *format = -1;  /* Unknown format */
+	}
+
+	/* Look for quoted operator string */
+	start = strchr(p, '"');
+	if (!start) {
+		if (oper) oper[0] = '\0';
+		return 0;  /* No operator registered */
+	}
+	start++;
+	end = strchr(start, '"');
+	if (!end) return -1;
+
+	if (oper) {
+		size_t len = end - start;
+		if (len >= oper_len) len = oper_len - 1;
+		memcpy(oper, start, len);
+		oper[len] = '\0';
+	}
+	return 0;
+}
+
+/*!
+ * \brief Parse +CBC response
+ * Format: +CBC: <bcs>,<bcl> where bcs=charging status, bcl=level 0-100
+ * \param buf response buffer
+ * \param level pointer to store battery level (0-100)
+ * \param charging pointer to store charging status (0=not, 1=charging)
+ * \return 0 on success, -1 on error
+ *
+ * bcs values:
+ *   0 = Not charging (battery powered)
+ *   1 = Charging
+ *   2 = Charging finished
+ *   3 = Powered by external source, no battery
+ */
+static int hfp_parse_cbc(char *buf, int *level, int *charging)
+{
+	int bcs, bcl;
+	char *p = strchr(buf, ':');
+	if (!p) return -1;
+	p++;
+
+	if (sscanf(p, "%d,%d", &bcs, &bcl) != 2)
+		return -1;
+
+	if (level) *level = bcl;
+	if (charging) {
+		/* bcs: 0=not charging, 1=charging, 2=finished, 3=no battery */
+		*charging = (bcs == 1) ? 1 : 0;
+	}
+	return 0;
+}
+
+/*!
  * \brief Handle BUSY messages.
  * \param pvt a mbl_pvt structure
  * \retval 0 success
@@ -4807,6 +5410,79 @@ static void *do_monitor_phone(void *data)
 			}
 			ast_mutex_unlock(&pvt->lock);
 			break;
+		case AT_CREG:
+			ast_mutex_lock(&pvt->lock);
+			{
+				int stat = hfp_parse_creg(buf);
+				if (stat >= 0) {
+					hfp->creg = stat;
+					ast_debug(2, "[%s] CREG status: %d\n", pvt->id, stat);
+				}
+				/* If this was a queued response, mark as received */
+				if ((entry = msg_queue_head(pvt)) && entry->expected == AT_CREG) {
+					msg_queue_push(pvt, AT_OK, AT_CREG);
+					msg_queue_free_and_pop(pvt);
+				}
+			}
+			ast_mutex_unlock(&pvt->lock);
+			break;
+		case AT_CGREG:
+			ast_mutex_lock(&pvt->lock);
+			{
+				int stat = hfp_parse_creg(buf);  /* Same format as CREG */
+				if (stat >= 0) {
+					hfp->cgreg = stat;
+					ast_debug(2, "[%s] CGREG status: %d\n", pvt->id, stat);
+				}
+				if ((entry = msg_queue_head(pvt)) && entry->expected == AT_CGREG) {
+					msg_queue_push(pvt, AT_OK, AT_CGREG);
+					msg_queue_free_and_pop(pvt);
+				}
+			}
+			ast_mutex_unlock(&pvt->lock);
+			break;
+		case AT_COPS:
+			ast_mutex_lock(&pvt->lock);
+			{
+				char oper[64];
+				int fmt = -1;
+				if (hfp_parse_cops(buf, oper, sizeof(oper), &fmt) == 0) {
+					if ((entry = msg_queue_head(pvt)) && entry->expected == AT_COPS) {
+						/* Check actual format returned by phone, not what we requested */
+						if (fmt == 2) {
+							/* Numeric format - this is MCC/MNC */
+							ast_copy_string(hfp->mccmnc, oper, sizeof(hfp->mccmnc));
+							ast_debug(2, "[%s] COPS MCC/MNC: %s\n", pvt->id, hfp->mccmnc);
+						} else {
+							/* Alphanumeric format (0) or unknown - this is provider name */
+							ast_copy_string(hfp->provider_name, oper, sizeof(hfp->provider_name));
+							ast_debug(2, "[%s] COPS Provider: %s\n", pvt->id, hfp->provider_name);
+						}
+						/* Continue to CREG chain */
+						msg_queue_push(pvt, AT_OK, AT_COPS_SET_ALPHA);
+						msg_queue_free_and_pop(pvt);
+					}
+				}
+			}
+			ast_mutex_unlock(&pvt->lock);
+			break;
+		case AT_CBC:
+			ast_mutex_lock(&pvt->lock);
+			{
+				int level, charging;
+				if (hfp_parse_cbc(buf, &level, &charging) == 0) {
+					hfp->battery_percent = level;
+					hfp->charging = charging;
+					ast_debug(2, "[%s] CBC: %d%% %s\n", pvt->id, level,
+						charging ? "charging" : "discharging");
+				}
+				if ((entry = msg_queue_head(pvt)) && entry->expected == AT_CBC) {
+					msg_queue_push(pvt, AT_OK, AT_CBC);
+					msg_queue_free_and_pop(pvt);
+				}
+			}
+			ast_mutex_unlock(&pvt->lock);
+			break;
 		case AT_UNKNOWN:
 			ast_debug(1, "[%s] ignoring unknown message: %s\n", pvt->id, buf);
 			break;
@@ -4857,6 +5533,12 @@ e_cleanup:
 
 	msg_queue_flush(pvt);
 
+	/* Cancel status polling if scheduled */
+	if (pvt->status_sched_id != -1) {
+		AST_SCHED_DEL(pvt->sched, pvt->status_sched_id);
+		pvt->status_sched_id = -1;
+	}
+
 	pvt->connected = 0;
 	hfp->initialized = 0;
 	if (!pvt->profile_incompatible)
@@ -4889,6 +5571,35 @@ static int headset_send_ring(const void *data)
 		return 0;
 	}
 	return 1;
+}
+
+/*!
+ * \brief Periodic status polling callback
+ * Queries battery status and registration when device is idle
+ * \param data pointer to mbl_pvt structure
+ * \return 1 to reschedule, 0 to stop
+ */
+static int mbl_status_poll(const void *data)
+{
+	struct mbl_pvt *pvt = (struct mbl_pvt *) data;
+
+	ast_mutex_lock(&pvt->lock);
+
+	/* Skip if device not ready or in a call */
+	if (!pvt->connected || !pvt->hfp || !pvt->hfp->initialized || pvt->owner) {
+		ast_mutex_unlock(&pvt->lock);
+		return 1;  /* Reschedule */
+	}
+
+	/* Query battery status if supported */
+	if (!pvt->hfp->no_cbc) {
+		if (hfp_send_cbc(pvt->hfp) || msg_queue_push(pvt, AT_CBC, AT_CBC)) {
+			ast_debug(1, "[%s] error querying CBC for status poll\n", pvt->id);
+		}
+	}
+
+	ast_mutex_unlock(&pvt->lock);
+	return 1;  /* Reschedule */
 }
 
 static void *do_monitor_headset(void *data)
@@ -5727,6 +6438,7 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 	pvt->sco_mtu = DEVICE_FRAME_SIZE_DEFAULT;
 	pvt->monitor_thread = AST_PTHREADT_NULL;
 	pvt->ring_sched_id = -1;
+	pvt->status_sched_id = -1;
 	pvt->has_sms = 1;
 
 
@@ -5790,6 +6502,11 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 		pvt->hfp->owner = pvt;
 		pvt->hfp->rport = pvt->rfcomm_port;
 		pvt->hfp->nocallsetup = pvt->no_callsetup;
+		/* Initialize device status fields to unknown */
+		pvt->hfp->battery_percent = -1;
+		pvt->hfp->charging = -1;
+		pvt->hfp->creg = -1;
+		pvt->hfp->cgreg = -1;
 	} else {
 		pvt->has_sms = 0;
 	}
