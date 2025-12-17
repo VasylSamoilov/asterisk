@@ -27,14 +27,21 @@ address=00:80:C8:35:52:78
 ; Every device listed below will be available for calls in and out of Asterisk.
 ; Each device needs an adapter=xxxx entry which determines which bluetooth adapter is used.
 ; Use the CLI command 'mobile search' to discover devices.
-; Use the CLI command 'mobile show devices' to see device status.
+; Use the CLI command 'mobile show devices' to see device status, including:
+;   - Signal strength
+;   - Battery level
+;   - Operator / Provider name
+;   - Roaming status
 ;
 ; To place a call out through a mobile phone use Dial(Mobile/[device]/NNN.....) or Dial(Mobile/gn/NNN......) in your dialplan.
 ; To call a headset use Dial(Mobile/[device]).
 
 [LGTU550]
 address=00:E0:91:7F:46:44	; the address of the phone
-port=4				; the rfcomm port number (from mobile search)
+port=4				; the rfcomm port number (from mobile search).
+                                ; optional. If omitted or set to 'auto', chan_mobile will auto-detect the port via SDP.
+                                ; For 'type=phone', it looks for HFP (Handsfree) service.
+                                ; For 'type=headset', it looks for HSP (Headset) service.
 context=incoming-mobile		; dialplan context for incoming calls
 adapter=dlink			; adapter to use
 group=1				; this phone is in channel group 1
@@ -43,7 +50,7 @@ group=1				; this phone is in channel group 1
 
 [blackberry]
 address=00:60:57:32:7E:B2
-port=2
+port=auto           ; Auto-detect port (search for HFP since type defaults to phone)
 context=incoming-mobile
 adapter=dlink
 group=1
@@ -60,10 +67,11 @@ group=1				; this phone is in channel group 1 also.
 address=00:0B:9E:11:AE:C6
 port=1
 type=headset			; This is a headset, not a Phone !
+                        ; When type=headset, chan_mobile will only look for HSP profile.
 adapter=blue
 
 [headset1]
 address=00:0B:9E:11:74:A5
-port=1
+port=auto               ; Auto-detect HSP port
 type=headset
 adapter=dlink
