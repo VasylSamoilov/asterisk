@@ -5677,7 +5677,8 @@ static int handle_response_error(struct mbl_pvt *pvt, char *buf)
 			|| entry->expected == AT_CMS_ERROR
 			|| entry->expected == AT_CMGR
 			|| entry->expected == AT_CBC
-			|| entry->expected == AT_SMS_PROMPT)) {
+			|| entry->expected == AT_SMS_PROMPT
+			|| entry->expected == AT_CSCS)) {
 		switch (entry->response_to) {
 
 		/* initialization stuff */
