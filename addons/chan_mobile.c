@@ -47,6 +47,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/un.h>
 
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
@@ -74,6 +75,8 @@
 #include "asterisk/dsp.h"
 #include "asterisk/app.h"
 #include "asterisk/manager.h"
+#include "asterisk/json.h"
+#include "asterisk/uuid.h"
 #include "asterisk/message.h"
 #include "asterisk/io.h"
 #include "asterisk/smoother.h"
@@ -191,6 +194,7 @@ struct mbl_pvt {
 	int sco_rx_candidate;				/*!< differing received block size seen in a row... */
 	int sco_rx_candidate_count;			/*!< ...and how many times */
 	unsigned int sco_in_reset:1;			/*!< bt_in_smoother must be reset by mbl_read() */
+	char map_socket[108];				/*!< MAP bridge submit socket; send SMS via MAP when set */
 	int bt_ver;					/*!< Remote Bluetooth Version (LMP) */
 	pthread_t monitor_thread;			/*!< monitor thread handle */
 	int timeout;					/*!< used to set the timeout for rfcomm data (may be used in the future) */
@@ -397,6 +401,32 @@ static struct ast_cli_entry mbl_cli[] = {
 		<para>Messages are sent using the <literal>MessageSend()</literal> application
 		with a special URI format that specifies both the device and destination number.</para>
 		<xi:include xpointer="xpointer(/docs/info[@name='Mobile_Message_URI'])" />
+		<para><emphasis>Received SMS:</emphasis></para>
+		<para>A received SMS is routed to extension <literal>sms</literal> in the device
+		<literal>context</literal>, from <literal>mobile:device_id/sender</literal>, with
+		these message variables set:</para>
+		<variablelist>
+			<variable name="SMSSRC">
+				<para>Sender address.</para>
+			</variable>
+			<variable name="SMSNAME">
+				<para>Sender name, if the phone reports one.</para>
+			</variable>
+			<variable name="SMSTXT">
+				<para>Message text (also the message body).</para>
+			</variable>
+			<variable name="SMSVIA">
+				<para>How the message was received.</para>
+				<value name="hfp">HFP AT commands.</value>
+				<value name="map">Bluetooth MAP bridge.</value>
+				<value name="map-status">Status report from the MAP bridge about an
+				outgoing message, not an SMS. Do not forward these as SMS.</value>
+			</variable>
+			<variable name="SMSTIME">
+				<para>Phone timestamp (<literal>YYYYMMDDTHHMMSS</literal>, phone local time).
+				MAP only.</para>
+			</variable>
+		</variablelist>
 	</info>
 	<info name="Mobile_Message_URI" language="en_US" tech="mobile">
 		<para><emphasis>URI Format:</emphasis></para>
@@ -415,7 +445,50 @@ static struct ast_cli_entry mbl_cli[] = {
 		<para>- Better handling of Unicode and multi-part messages in PDU mode</para>
 		<para>However, <literal>MobileSendSMS</literal> remains available for simple use cases
 		and backward compatibility with existing dialplans.</para>
+		<para><emphasis>Bluetooth MAP:</emphasis> phones that do not offer SMS over HFP
+		(for example iPhone) can send and receive SMS through the MAP bridge in
+		<filename>contrib/mobile-map</filename>. Set <literal>map_socket</literal> for the
+		device; messages sent to <literal>mobile:device/number</literal> are then handed to
+		the bridge, and received messages arrive in the same <literal>sms</literal>
+		extension with <variable>SMSVIA</variable> set to <literal>map</literal>.</para>
 	</info>
+	<manager name="MobileMAPIncoming" language="en_US">
+		<synopsis>
+			Deliver an SMS received through Bluetooth MAP to the dialplan.
+		</synopsis>
+		<syntax>
+			<xi:include xpointer="xpointer(/docs/manager[@name='Login']/syntax/parameter[@name='ActionID'])" />
+			<parameter name="Device" required="true">
+				<para>The chan_mobile device id the message was received on.</para>
+			</parameter>
+			<parameter name="From">
+				<para>Sender address as reported by the phone.</para>
+			</parameter>
+			<parameter name="Name">
+				<para>Sender name, if known.</para>
+			</parameter>
+			<parameter name="Timestamp">
+				<para>Phone timestamp of the message, exposed as <variable>SMSTIME</variable>.</para>
+			</parameter>
+			<parameter name="Kind">
+				<para><literal>status</literal> for a bridge status report about an outgoing
+				message; <variable>SMSVIA</variable> is then <literal>map-status</literal>.</para>
+			</parameter>
+			<parameter name="BodyPart" required="true">
+				<para>Base64 of the UTF-8 message text. Repeat the header to split long
+				bodies; the parts are concatenated in order before decoding.</para>
+			</parameter>
+		</syntax>
+		<description>
+			<para>Used by the MAP bridge in <filename>contrib/mobile-map</filename>. The message is
+			queued to extension <literal>sms</literal> in the device context, exactly like an
+			SMS received over HFP, with <variable>SMSSRC</variable>, <variable>SMSNAME</variable>,
+			<variable>SMSTXT</variable>, <variable>SMSVIA</variable> (<literal>map</literal>) and
+			<variable>SMSTIME</variable> set.</para>
+			<para>Fails, so that the bridge keeps the message and retries, when the device is
+			unknown or its context has no <literal>sms</literal> extension.</para>
+		</description>
+	</manager>
  ***/
 
 /* App stuff */
@@ -461,6 +534,9 @@ static int sco_write(int s, char *buf, int len);
 static int sco_accept(int *id, int fd, short events, void *data);
 static int sco_bind(struct adapter_pvt *adapter);
 static void sco_reset_audio(struct mbl_pvt *pvt, int mtu);
+static int mbl_queue_sms(struct mbl_pvt *pvt, const char *number, const char *name,
+	const char *text, const char *via, const char *stamp);
+static int mbl_map_submit(const char *device, const char *path, const char *number, const char *body);
 static void sco_observe_packet(struct mbl_pvt *pvt, int received);
 
 static void *do_sco_listen(void *data);
@@ -926,7 +1002,7 @@ static char *handle_cli_mobile_show_devices(struct ast_cli_entry *e, int cmd, st
 		}
 
 		/* SMS status */
-		ast_copy_string(sms_status, sms_mode_to_str(pvt->sms_mode), sizeof(sms_status));
+		ast_copy_string(sms_status, !ast_strlen_zero(pvt->map_socket) ? "map" : sms_mode_to_str(pvt->sms_mode), sizeof(sms_status));
 		
 		/* Encoding */
 		ast_copy_string(encoding, pvt->cscs_active[0] ? pvt->cscs_active : "Default", sizeof(encoding));
@@ -1091,6 +1167,9 @@ static char *handle_cli_mobile_show_device(struct ast_cli_entry *e, int cmd, str
 
 	/* SMS and charset capabilities */
 	ast_cli(a->fd, "SMS Support: %s\n", sms_mode_to_str(pvt->sms_mode));
+	if (!ast_strlen_zero(pvt->map_socket)) {
+		ast_cli(a->fd, "SMS via MAP: %s (outgoing SMS use the MAP bridge)\n", pvt->map_socket);
+	}
 	ast_cli(a->fd, "Active Charset: %s\n", pvt->cscs_active[0] ? pvt->cscs_active : "-");
 	ast_cli(a->fd, "Supported Charsets: %s\n", pvt->cscs_list[0] ? pvt->cscs_list : "-");
 
@@ -6517,9 +6596,7 @@ static int handle_response_cmti(struct mbl_pvt *pvt, char *buf)
 static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
 {
 	char *from_number = NULL, *from_name = NULL, *text = NULL;
-	struct ast_msg *msg;
 	struct msg_queue_entry *entry;
-	char from_uri[128];
 	char *decoded_text = NULL;
 	char *decoded_name = NULL;
 	char pdu_from[32];
@@ -6672,46 +6749,12 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
 		}
 		pvt->incoming_sms = 0;
 
-		/* Create message using ast_msg API for SIP MESSAGE routing */
-		msg = ast_msg_alloc();
-		if (!msg) {
-			ast_log(LOG_ERROR, "[%s] failed to allocate ast_msg for SMS\n", pvt->id);
-			ast_free(decoded_text);
-			return 0;  /* Non-fatal, don't disconnect */
-		}
-
-		/* Set message properties */
-		snprintf(from_uri, sizeof(from_uri), "mobile:%s/%s", pvt->id, 
-			from_number ? from_number : "unknown");
-		ast_msg_set_from(msg, "%s", from_uri);
-		ast_msg_set_to(msg, "%s", "sms:incoming");
-		ast_msg_set_body(msg, "%s", text ? text : "");
-		ast_msg_set_exten(msg, "sms");
-		ast_msg_set_context(msg, "%s", pvt->context);
-		ast_msg_set_tech(msg, "mobile");
-		ast_msg_set_endpoint(msg, "%s", pvt->id);
-		ast_msg_set_var(msg, "SMSSRC", from_number ? from_number : "");
-		ast_msg_set_var(msg, "SMSNAME", from_name ? from_name : "");
-		ast_msg_set_var(msg, "SMSTXT", text ? text : "");
-
-		ast_log(LOG_NOTICE, "[%s] Setting SMS variables: SMSSRC='%s', SMSNAME='%s', SMSTXT='%s', Body='%s'\n",
-			pvt->id, 
-			from_number ? from_number : "",
-			from_name ? from_name : "",
-			text ? text : "",
-			text ? text : "");
+		ast_log(LOG_NOTICE, "[%s] SMS received from '%s'\n", pvt->id, from_number ? from_number : "");
+		mbl_queue_sms(pvt, from_number, from_name, text, "hfp", NULL);
 
 		ast_free(decoded_text);  /* Free if allocated */
 		ast_free(decoded_name);  /* Free if allocated */
 
-		/* Queue message for routing through dialplan */
-		if (ast_msg_queue(msg)) {
-			ast_log(LOG_WARNING, "[%s] failed to queue SMS message for routing\n", pvt->id);
-			/* ast_msg_queue handles cleanup on failure */
-		} else {
-			ast_verb(3, "[%s] SMS: queued for dialplan routing\n", pvt->id);
-		}
-		
 		/* Check if there are more pending SMS messages to read */
 		if (pvt->sms_pending_count > 0) {
 			ast_debug(1, "[%s] SMS: %d more pending, triggering next read\n", 
@@ -7693,6 +7736,223 @@ static int sms_decode_pdu(const char *pdu_hex, char *from_number, size_t from_le
  * URI format: mobile:device_id/phone_number
  * Example: mobile:phone1/+15551234567
  */
+
+/*
+ * SMS routing shared by HFP and the Bluetooth MAP bridge
+ */
+
+/*!
+ * \brief Queue a received SMS into the dialplan (extension "sms" in the device context).
+ * \param via "hfp", "map" or "map-status", exposed as SMSVIA
+ * \param stamp phone timestamp (MAP only) or NULL, exposed as SMSTIME
+ * \retval 0 queued
+ * \retval -1 on failure
+ * \retval -2 MAP message with no destination in the dialplan
+ */
+static int mbl_queue_sms(struct mbl_pvt *pvt, const char *number, const char *name,
+	const char *text, const char *via, const char *stamp)
+{
+	struct ast_msg *msg;
+
+	if (!(msg = ast_msg_alloc())) {
+		ast_log(LOG_ERROR, "[%s] failed to allocate ast_msg for SMS\n", pvt->id);
+		return -1;
+	}
+
+	ast_msg_set_from(msg, "mobile:%s/%s", pvt->id, !ast_strlen_zero(number) ? number : "unknown");
+	ast_msg_set_to(msg, "%s", "sms:incoming");
+	ast_msg_set_body(msg, "%s", S_OR(text, ""));
+	ast_msg_set_exten(msg, "sms");
+	ast_msg_set_context(msg, "%s", pvt->context);
+	ast_msg_set_tech(msg, "mobile");
+	ast_msg_set_endpoint(msg, "%s", pvt->id);
+	ast_msg_set_var(msg, "SMSSRC", S_OR(number, ""));
+	ast_msg_set_var(msg, "SMSNAME", S_OR(name, ""));
+	ast_msg_set_var(msg, "SMSTXT", S_OR(text, ""));
+	ast_msg_set_var(msg, "SMSVIA", via);
+	ast_msg_set_var(msg, "SMSTIME", S_OR(stamp, ""));
+
+	/* The MAP bridge deletes a message once it is accepted: refuse it while
+	 * there is nowhere to route it, so the bridge keeps it and retries. */
+	if (strcmp(via, "hfp") && !ast_msg_has_destination(msg)) {
+		ast_log(LOG_WARNING, "[%s] no 'sms' extension in context '%s' for MAP SMS\n", pvt->id, pvt->context);
+		ast_msg_destroy(msg);
+		return -2;
+	}
+
+	/* ast_msg_queue() releases the message on failure as well. */
+	if (ast_msg_queue(msg)) {
+		ast_log(LOG_WARNING, "[%s] failed to queue SMS message for routing\n", pvt->id);
+		return -1;
+	}
+	ast_verb(3, "[%s] SMS (%s): queued for dialplan routing\n", pvt->id, via);
+	return 0;
+}
+
+/*!
+ * \brief Hand an outgoing SMS to the Bluetooth MAP bridge (contrib/mobile-map).
+ *
+ * One JSON request line over a local stream socket; the bridge checks our
+ * uid with SO_PEERCRED, queues the message durably and answers with one
+ * JSON line. A positive answer means queued for the phone, not delivered.
+ * Never logs the message body.
+ *
+ * \retval 0 accepted by the bridge, -1 otherwise
+ */
+static int mbl_map_submit(const char *device, const char *path, const char *number, const char *body)
+{
+	struct sockaddr_un addr = { .sun_family = AF_UNIX, };
+	struct timeval tv = { .tv_sec = 8, };
+	RAII_VAR(struct ast_json *, request, NULL, ast_json_unref);
+	RAII_VAR(struct ast_json *, reply, NULL, ast_json_unref);
+	char uuid[AST_UUID_STR_LEN], id[33], buf[2048];
+	char *text = NULL, *nl;
+	size_t used = 0, len;
+	int s, i, j, res = -1;
+	ssize_t r;
+
+	if (strlen(path) >= sizeof(addr.sun_path)) {
+		return -1;
+	}
+	strcpy(addr.sun_path, path);
+
+	/* Request id: 32 hex digits. */
+	ast_uuid_generate_str(uuid, sizeof(uuid));
+	for (i = 0, j = 0; uuid[i] && j < 32; i++) {
+		if (uuid[i] != '-') {
+			id[j++] = uuid[i];
+		}
+	}
+	id[j] = '\0';
+
+	if (!(request = ast_json_pack("{s: s, s: s, s: s, s: s}",
+			"id", id, "device", device, "to", number, "body", body))) {
+		return -1;
+	}
+	if (!(text = ast_json_dump_string(request))) {
+		return -1;
+	}
+
+	if ((s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) {
+		ast_json_free(text);
+		return -1;
+	}
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+	if (connect(s, (struct sockaddr *) &addr, sizeof(addr))) {
+		ast_log(LOG_WARNING, "[%s] MAP bridge not reachable at %s: %s\n", device, path, strerror(errno));
+		goto done;
+	}
+	len = strlen(text);
+	if (ast_carefulwrite(s, text, len, 8000) || ast_carefulwrite(s, "\n", 1, 8000)) {
+		ast_log(LOG_WARNING, "[%s] MAP bridge write failed\n", device);
+		goto done;
+	}
+	while (used < sizeof(buf) - 1) {
+		r = recv(s, buf + used, sizeof(buf) - 1 - used, 0);
+		if (r <= 0) {
+			break;
+		}
+		used += r;
+		buf[used] = '\0';
+		if (strchr(buf, '\n')) {
+			break;
+		}
+	}
+	buf[used] = '\0';
+	if (!(nl = strchr(buf, '\n'))) {
+		ast_log(LOG_WARNING, "[%s] MAP bridge gave no answer\n", device);
+		goto done;
+	}
+	*nl = '\0';
+	if (!(reply = ast_json_load_string(buf, NULL)) || ast_json_typeof(reply) != AST_JSON_OBJECT) {
+		ast_log(LOG_WARNING, "[%s] MAP bridge answer is not valid JSON\n", device);
+		goto done;
+	}
+	if (ast_json_is_true(ast_json_object_get(reply, "ok"))) {
+		ast_verb(3, "[%s] SMS to %s queued for MAP (request %s, status %s)\n", device, number, id,
+			S_OR(ast_json_string_get(ast_json_object_get(reply, "status")), "queued"));
+		res = 0;
+	} else {
+		ast_log(LOG_WARNING, "[%s] MAP bridge refused SMS to %s: %s\n", device, number,
+			S_OR(ast_json_string_get(ast_json_object_get(reply, "reason")), "unknown"));
+	}
+
+done:
+	close(s);
+	ast_json_free(text);
+	return res;
+}
+
+/*! \brief AMI MobileMAPIncoming: the MAP bridge delivers a received SMS. */
+static int manager_map_incoming(struct mansession *s, const struct message *m)
+{
+	const char *device = astman_get_header(m, "Device");
+	const char *from = astman_get_header(m, "From");
+	const char *name = astman_get_header(m, "Name");
+	const char *stamp = astman_get_header(m, "Timestamp");
+	const char *kind = astman_get_header(m, "Kind");
+	struct ast_str *b64 = ast_str_create(1024);
+	unsigned char *text = NULL;
+	struct mbl_pvt *pvt;
+	unsigned int i;
+	int len, res;
+
+	if (!b64) {
+		astman_send_error(s, m, "Out of memory");
+		return 0;
+	}
+	/* The body is base64 split over repeated BodyPart headers: AMI lines are short. */
+	for (i = 0; i < m->hdrcount; i++) {
+		if (!strncasecmp(m->headers[i], "BodyPart:", 9)) {
+			ast_str_append(&b64, 0, "%s", ast_skip_blanks(m->headers[i] + 9));
+		}
+	}
+	if (ast_strlen_zero(device) || !ast_str_strlen(b64)) {
+		astman_send_error(s, m, "Invalid: Device and BodyPart are required");
+		goto done;
+	}
+	if (!(text = ast_calloc(1, ast_str_strlen(b64) + 1))) {
+		astman_send_error(s, m, "Out of memory");
+		goto done;
+	}
+	len = ast_base64decode(text, ast_str_buffer(b64), ast_str_strlen(b64));
+	text[len] = '\0';
+	if (len <= 0 || strlen((char *) text) != (size_t) len) {
+		astman_send_error(s, m, "Invalid: empty or binary body");
+		goto done;
+	}
+
+	AST_RWLIST_RDLOCK(&devices);
+	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
+		if (!strcmp(pvt->id, device)) {
+			break;
+		}
+	}
+	if (!pvt) {
+		AST_RWLIST_UNLOCK(&devices);
+		astman_send_error(s, m, "Unknown device");
+		goto done;
+	}
+	res = mbl_queue_sms(pvt, from, name, (char *) text,
+		!strcasecmp(kind, "status") ? "map-status" : "map", stamp);
+	AST_RWLIST_UNLOCK(&devices);
+	if (res == -2) {
+		astman_send_error(s, m, "No sms extension in the device context");
+		goto done;
+	} else if (res) {
+		astman_send_error(s, m, "Unable to queue message");
+		goto done;
+	}
+	astman_send_ack(s, m, "Message queued");
+
+done:
+	ast_free(text);
+	ast_free(b64);
+	return 0;
+}
+
 static int mobile_msg_send(const struct ast_msg *msg, const char *to, const char *from)
 {
 	struct mbl_pvt *pvt;
@@ -7743,6 +8003,21 @@ static int mobile_msg_send(const struct ast_msg *msg, const char *to, const char
 	if (!pvt) {
 		ast_log(LOG_ERROR, "mobile MESSAGE: device '%s' not found\n", device_id);
 		return -1;
+	}
+
+	/* Phones without HFP SMS (e.g. iPhone) can send through the MAP bridge. */
+	if (!ast_strlen_zero(pvt->map_socket)) {
+		char map_socket[sizeof(pvt->map_socket)];
+
+		ast_mutex_lock(&pvt->lock);
+		ast_copy_string(map_socket, pvt->map_socket, sizeof(map_socket));
+		ast_mutex_unlock(&pvt->lock);
+		body = ast_msg_get_body(msg);
+		if (ast_strlen_zero(body)) {
+			ast_log(LOG_WARNING, "mobile MESSAGE: empty message body\n");
+			return -1;
+		}
+		return mbl_map_submit(device_id, map_socket, number, body);
 	}
 
 	ast_mutex_lock(&pvt->lock);
@@ -9804,6 +10079,8 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
 			}
 		} else if (!strcasecmp(v->name, "context")) {
 			ast_copy_string(pvt->context, v->value, sizeof(pvt->context));
+		} else if (!strcasecmp(v->name, "map_socket")) {
+			ast_copy_string(pvt->map_socket, v->value, sizeof(pvt->map_socket));
 		} else if (!strcasecmp(v->name, "sms_delete_after_read")) {
 			pvt->sms_delete_after_read = ast_true(v->value);
 		} else if (!strcasecmp(v->name, "group")) {
@@ -9964,6 +10241,7 @@ static int unload_module(void)
 	ast_custom_function_unregister(&mobile_status_function);
 	ast_unregister_application(app_mblsendsms);
 	ast_msg_tech_unregister(&mobile_msg_tech);
+	ast_manager_unregister("MobileMAPIncoming");
 
 	/* signal everyone we are unloading */
 	set_unloading();
@@ -10072,6 +10350,8 @@ static int load_module(void)
 	ast_cli_register_multiple(mbl_cli, sizeof(mbl_cli) / sizeof(mbl_cli[0]));
 	ast_custom_function_register(&mobile_status_function);
 	ast_register_application_xml(app_mblsendsms, mbl_sendsms_exec);
+
+	ast_manager_register_xml("MobileMAPIncoming", EVENT_FLAG_MESSAGE, manager_map_incoming);
 
 	/* Register message technology for SIP MESSAGE routing */
 	if (ast_msg_tech_register(&mobile_msg_tech)) {

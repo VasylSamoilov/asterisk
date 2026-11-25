@@ -1,0 +1,18 @@
+{
+  "device": "00:11:22:33:44:55",
+  "adapter": "66:77:88:99:AA:BB",
+  "asterisk_device": "iphone",
+  "phone_timezone": "Europe/London",
+  "ami": {
+    "host": "127.0.0.1",
+    "port": 5038,
+    "username": "mobile-map",
+    "secret": "change-me"
+  },
+  "submit_socket": "/run/mobile-map/submit.sock",
+  "submit_user": "asterisk",
+  "default_country_code": "",
+  "trunk_prefix": "0",
+  "status_notices": false,
+  "status_sender": "MAP"
+}

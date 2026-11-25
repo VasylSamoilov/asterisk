@@ -77,6 +77,11 @@ group=1				; this phone is in channel group 1
 				; Default is OFF to avoid timeouts if phone permission not granted.
 				; See "SMS PERMISSIONS" section above.
 ;sms_delete_after_read=yes  ; Delete SMS from the device after reading (default: no)
+;map_socket=/run/mobile-map/submit.sock
+				; Send SMS for this device through the Bluetooth MAP bridge
+				; (contrib/mobile-map) instead of HFP AT commands. Use this for
+				; phones without SMS over HFP, such as iPhone. Received MAP SMS
+				; arrive in the 'sms' extension of 'context' with SMSVIA=map.
 ;nocallsetup=yes		; set this only if your phone reports that it supports call progress notification, but does not do it. Motorola L6 for example.
 
 [blackberry]

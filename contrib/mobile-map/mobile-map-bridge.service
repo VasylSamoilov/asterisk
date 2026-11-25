@@ -1,0 +1,24 @@
+# systemd *user* unit: obexd lives on the user's D-Bus session bus.
+# Install as ~/.config/systemd/user/mobile-map-bridge.service and run
+#   loginctl enable-linger <user>
+# so it runs without a desktop login. See README.md.
+[Unit]
+Description=Bluetooth MAP SMS bridge for chan_mobile
+Wants=obex.service
+After=obex.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/lib/mobile-map/mobile_map_bridge.py --config %h/.config/mobile-map/mobile-map.json --state %h/.local/state/mobile-map
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=65
+UMask=0077
+NoNewPrivileges=yes
+LogRateLimitIntervalSec=60
+LogRateLimitBurst=30
+
+[Install]
+WantedBy=default.target
